@@ -8,6 +8,11 @@ from firebase_admin import credentials, firestore
 import os
 import json
 import urllib.parse
+from dotenv import load_dotenv
+from agent import generate_personalized_resources
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Initialize Firebase
 def initialize_firebase():
@@ -88,6 +93,10 @@ class QuestionAnswer(BaseModel):
 class UserAnswers(BaseModel):
     email: str
     answers: List[QuestionAnswer]
+
+class ResourceGenerationRequest(BaseModel):
+    user_id: str
+    email: str
 
 # Root endpoint
 @app.get("/")
@@ -268,6 +277,205 @@ async def get_user_answers(email: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching user answers: {str(e)}")
+
+@app.post("/generate-resources/{user_id}")
+async def generate_resources_endpoint(user_id: str):
+    """
+    Generate personalized learning resources for a user based on their onboarding answers
+    """
+    try:
+        # Get user's latest onboarding answers
+        user_ref = db.collection('users').document(user_id)
+        user_doc = user_ref.get()
+        
+        if not user_doc.exists:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Get the latest question answers (get all and sort in Python to avoid index requirement)
+        answers_ref = db.collection('users').document(user_id).collection('question_answers')
+        answers_docs = list(answers_ref.stream())
+        
+        if not answers_docs:
+            raise HTTPException(status_code=404, detail="No onboarding answers found for this user")
+        
+        # Sort by submitted_at in Python to get the latest
+        try:
+            answers_docs.sort(key=lambda x: x.to_dict().get('submitted_at', 0), reverse=True)
+        except:
+            # If sorting fails, just use the first document
+            pass
+        
+        # Get the answers from the latest submission
+        latest_answers = answers_docs[0].to_dict()
+        user_answers = latest_answers.get('answers', [])
+        
+        if not user_answers:
+            raise HTTPException(status_code=400, detail="No answers found in the latest submission")
+        
+        # Generate personalized resources using Gemini
+        resources_data = await generate_personalized_resources(user_answers, db, user_id)
+        
+        return {
+            "message": "Personalized resources generated successfully",
+            "user_id": user_id,
+            "home_doc_id": resources_data["home_doc_id"],
+            "total_resources": resources_data["total_resources"],
+            "categories": list(resources_data["resources"].keys()),
+            "generated_at": resources_data["generated_at"]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating resources: {str(e)}")
+
+@app.post("/generate-resources-by-email/{email}")
+async def generate_resources_by_email_endpoint(email: str):
+    """
+    Generate personalized learning resources for a user by email
+    """
+    try:
+        # Decode URL-encoded email
+        decoded_email = urllib.parse.unquote(email)
+        
+        # Find the user by email
+        users_ref = db.collection('users')
+        query = users_ref.where('email', '==', decoded_email).limit(1)
+        users = list(query.stream())
+        
+        if not users:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_doc = users[0]
+        user_id = user_doc.id
+        
+        # Get the latest question answers (get all and sort in Python to avoid index requirement)
+        answers_ref = db.collection('users').document(user_id).collection('question_answers')
+        answers_docs = list(answers_ref.stream())
+        
+        if not answers_docs:
+            raise HTTPException(status_code=404, detail="No onboarding answers found for this user")
+        
+        # Sort by submitted_at in Python to get the latest
+        try:
+            answers_docs.sort(key=lambda x: x.to_dict().get('submitted_at', 0), reverse=True)
+        except:
+            # If sorting fails, just use the first document
+            pass
+        
+        # Get the answers from the latest submission
+        latest_answers = answers_docs[0].to_dict()
+        user_answers = latest_answers.get('answers', [])
+        
+        if not user_answers:
+            raise HTTPException(status_code=400, detail="No answers found in the latest submission")
+        
+        # Generate personalized resources using Gemini
+        resources_data = await generate_personalized_resources(user_answers, db, user_id)
+        
+        return {
+            "message": "Personalized resources generated successfully",
+            "email": decoded_email,
+            "user_id": user_id,
+            "home_doc_id": resources_data["home_doc_id"],
+            "total_resources": resources_data["total_resources"],
+            "categories": list(resources_data["resources"].keys()),
+            "generated_at": resources_data["generated_at"]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating resources: {str(e)}")
+
+@app.get("/home/{user_id}")
+async def get_user_home_resources(user_id: str):
+    """
+    Get all generated home resources for a user
+    """
+    try:
+        # Get all home documents for this user (without ordering to avoid index requirement)
+        home_ref = db.collection('home')
+        query = home_ref.where('user_id', '==', user_id)
+        home_docs = list(query.stream())
+        
+        if not home_docs:
+            raise HTTPException(status_code=404, detail="No resources found for this user")
+        
+        # Sort by created_at in Python instead of Firestore to avoid index requirement
+        home_docs_with_data = []
+        for doc in home_docs:
+            doc_data = doc.to_dict()
+            doc_data['home_doc_id'] = doc.id
+            home_docs_with_data.append(doc_data)
+        
+        # Sort by created_at (most recent first)
+        try:
+            home_docs_with_data.sort(key=lambda x: x.get('created_at', 0), reverse=True)
+        except:
+            # If sorting fails, just return the first document
+            pass
+        
+        # Return the latest resources
+        return home_docs_with_data[0]
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching home resources: {str(e)}")
+
+@app.get("/home-by-email/{email}")
+async def get_user_home_resources_by_email(email: str):
+    """
+    Get all generated home resources for a user by email
+    """
+    try:
+        # Decode URL-encoded email
+        decoded_email = urllib.parse.unquote(email)
+        
+        # Find the user by email
+        users_ref = db.collection('users')
+        query = users_ref.where('email', '==', decoded_email).limit(1)
+        users = list(query.stream())
+        
+        if not users:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_doc = users[0]
+        user_id = user_doc.id
+        
+        # Get all home documents for this user (without ordering to avoid index requirement)
+        home_ref = db.collection('home')
+        query = home_ref.where('user_id', '==', user_id)
+        home_docs = list(query.stream())
+        
+        if not home_docs:
+            raise HTTPException(status_code=404, detail="No resources found for this user")
+        
+        # Sort by created_at in Python instead of Firestore to avoid index requirement
+        home_docs_with_data = []
+        for doc in home_docs:
+            doc_data = doc.to_dict()
+            doc_data['home_doc_id'] = doc.id
+            home_docs_with_data.append(doc_data)
+        
+        # Sort by created_at (most recent first)
+        try:
+            home_docs_with_data.sort(key=lambda x: x.get('created_at', 0), reverse=True)
+        except:
+            # If sorting fails, just return the first document
+            pass
+        
+        # Return the latest resources
+        home_data = home_docs_with_data[0]
+        home_data['email'] = decoded_email
+        
+        return home_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching home resources: {str(e)}")
 
 if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
