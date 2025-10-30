@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import uvicorn
@@ -56,6 +57,15 @@ app = FastAPI(
     title="AlgoGuide Backend API",
     description="A simple backend application with Firebase integration",
     version="1.0.0"
+)
+
+# CORS configuration to allow browser preflight (OPTIONS) requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # TODO: restrict to your frontend origin(s)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
 )
 
 # Pydantic models
@@ -260,4 +270,26 @@ async def get_user_answers(email: str):
         raise HTTPException(status_code=500, detail=f"Error fetching user answers: {str(e)}")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    host = os.getenv("HOST", "0.0.0.0")
+    port_env = os.getenv("PORT")
+    try:
+        port = int(port_env) if port_env else 8000
+    except ValueError:
+        port = 8000
+
+    try:
+        uvicorn.run(app, host=host, port=port)
+    except OSError as e:
+        # macOS errno 48, Linux errno 98 => address already in use
+        if getattr(e, "errno", None) in (48, 98):
+            for candidate in range(port + 1, port + 6):
+                try:
+                    print(f"Port {port} busy. Trying {candidate}...")
+                    uvicorn.run(app, host=host, port=candidate)
+                    break
+                except OSError as e2:
+                    if getattr(e2, "errno", None) in (48, 98):
+                        continue
+                    raise
+        else:
+            raise
