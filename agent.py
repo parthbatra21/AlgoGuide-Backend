@@ -6,6 +6,7 @@ from typing import List, Dict, Any
 import google.generativeai as genai
 from bs4 import BeautifulSoup
 import re
+import urllib.parse
 from datetime import datetime
 import firebase_admin
 from firebase_admin import firestore
@@ -19,12 +20,19 @@ class GeminiWebAgent:
             api_key (str): Gemini API key. If not provided, will try to get from environment variable GEMINI_API_KEY
         """
         self.api_key = api_key or os.getenv('GEMINI_API_KEY')
-        if not self.api_key:
-            raise ValueError("Gemini API key is required. Set GEMINI_API_KEY environment variable or pass it to constructor.")
-        
-        # Configure Gemini
-        genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        self.model = None
+
+        # Configure Gemini if available. If not, we can still return GeeksforGeeks URLs
+        # and use simple fallback metadata.
+        if self.api_key:
+            genai.configure(api_key=self.api_key)
+            self.model = genai.GenerativeModel('gemini-1.5-flash')
+        else:
+            print(
+                "Warning: GEMINI_API_KEY not set. "
+                "Resource URL discovery will still work via GeeksforGeeks scraping, "
+                "but Gemini-based metadata generation may be limited."
+            )
         
         # Search engines and resources
         self.search_engines = [
@@ -181,49 +189,135 @@ class GeminiWebAgent:
         Returns:
             List of scraped resource data
         """
-        resources = []
-        
+        # We want real topic URLs from GeeksforGeeks (not Google search links).
+        resources: List[Dict[str, Any]] = []
+
+        # 1) Deterministic: scrape GeeksforGeeks search results for real article URLs
         try:
-            # Use Gemini to search and get URLs (simulated web search)
-            search_prompt = f"""
-            For the search query: "{query}"
-            
-            Provide a list of 5-10 high-quality URLs that would contain valuable learning resources for this topic.
-            Focus on:
-            - YouTube tutorials
-            - Blog posts on Medium, Dev.to
-            - GitHub repositories
-            - LeetCode/HackerRank problems
-            - Documentation and tutorials
-            - Course platforms (Coursera, Udemy)
-            
-            Return only URLs, one per line, without any additional text or formatting.
-            Make sure the URLs are realistic and would likely contain the requested content.
-            """
-            
-            response = self.model.generate_content(search_prompt)
-            urls = [url.strip() for url in response.text.split('\n') if url.strip() and url.startswith('http')]
-            
-            # For each URL, create resource metadata using Gemini
-            for url in urls[:max_results]:
-                resource = await self.create_resource_metadata(url, query)
-                if resource:
-                    resources.append(resource)
-                    
+            gfg_urls = await self.search_geeksforgeeks(query=query, max_results=max_results)
         except Exception as e:
-            print(f"Error searching for query '{query}': {e}")
-            # Create fallback resource
-            resources.append({
-                "title": f"Learning Resource: {query}",
-                "url": f"https://www.google.com/search?q={query.replace(' ', '+')}",
-                "description": f"Search results for {query}",
-                "resource_type": "search",
-                "difficulty": "beginner",
-                "tags": query.split(),
-                "created_at": datetime.utcnow().isoformat()
-            })
-        
+            print(f"Error searching GeeksforGeeks for query '{query}': {e}")
+            gfg_urls = []
+
+        # 2) Build resource objects
+        for url in gfg_urls[:max_results]:
+            resource = await self.create_resource_metadata(url, query)
+            if resource:
+                resources.append(resource)
+            else:
+                resources.append(self._basic_gfg_resource(url=url, query=query))
+
+        # 3) Final fallback: still use GeeksforGeeks search page (never Google)
+        if not resources:
+            resources.append(
+                {
+                    "title": f"GeeksforGeeks search: {query}",
+                    "url": self._gfg_search_url(query),
+                    "description": f"GeeksforGeeks search results for {query}",
+                    "resource_type": "search",
+                    "difficulty": "beginner",
+                    "tags": query.split(),
+                    "created_at": datetime.utcnow().isoformat(),
+                    "query": query,
+                    "source": "geeksforgeeks_search_fallback",
+                }
+            )
+
         return resources
+
+    def _gfg_search_url(self, query: str) -> str:
+        return f"https://www.geeksforgeeks.org/?s={urllib.parse.quote_plus(query)}"
+
+    def _basic_gfg_resource(self, url: str, query: str) -> Dict[str, Any]:
+        return {
+            "title": f"GeeksforGeeks: {query}",
+            "url": url,
+            "description": f"GeeksforGeeks article explaining {query}",
+            "resource_type": "blog",
+            "difficulty": "beginner",
+            "estimated_time": 20,
+            "tags": query.split(),
+            "created_at": datetime.utcnow().isoformat(),
+            "query": query,
+            "source": "geeksforgeeks",
+        }
+
+    def _is_valid_gfg_article_url(self, url: str) -> bool:
+        """
+        Best-effort filter to keep only real GeeksforGeeks article/tutorial URLs.
+        """
+        if not url or "geeksforgeeks.org" not in url:
+            return False
+        if "?s=" in url:
+            return False
+        # Exclude non-article sections
+        blocked_prefixes = (
+            "https://www.geeksforgeeks.org/tag/",
+            "https://www.geeksforgeeks.org/category/",
+            "https://www.geeksforgeeks.org/author/",
+            "https://www.geeksforgeeks.org/page/",
+        )
+        return not url.startswith(blocked_prefixes)
+
+    async def search_geeksforgeeks(self, query: str, max_results: int = 5) -> List[str]:
+        """
+        Search GeeksforGeeks directly and return real article URLs.
+        This avoids returning generic Google search links.
+        """
+        search_url = self._gfg_search_url(query)
+
+        timeout = aiohttp.ClientTimeout(total=12)
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(search_url, allow_redirects=True) as resp:
+                html = await resp.text(errors="ignore")
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Common GfG search results use WordPress-like entry titles
+        candidate_links = soup.select(
+            "h2.entry-title a, h3.entry-title a, .entry-title a, article a"
+        )
+
+        urls: List[str] = []
+        seen = set()
+
+        for a in candidate_links:
+            href = a.get("href")
+            if not href:
+                continue
+            href = href.strip()
+
+            # Normalize protocol-relative URLs
+            if href.startswith("//"):
+                href = "https:" + href
+
+            # Some links are relative
+            if href.startswith("/"):
+                href = "https://www.geeksforgeeks.org" + href
+
+            # Strip fragments for dedupe
+            href = href.split("#", 1)[0]
+
+            if not self._is_valid_gfg_article_url(href):
+                continue
+
+            if href in seen:
+                continue
+            seen.add(href)
+            urls.append(href)
+
+            if len(urls) >= max_results:
+                break
+
+        return urls
 
     async def create_resource_metadata(self, url: str, query: str) -> Dict[str, Any]:
         """
